@@ -11,19 +11,20 @@ import (
 
 // Config holds all runtime configuration.
 type Config struct {
-	Host        string
-	Port        int
-	Username    string
-	Password    string
-	TLS         bool
-	StartTLS    bool
-	Folders     []string
-	ArchiveRoot string
-	MaxAge      time.Duration
-	BatchSize   int
-	DryRun      bool
-	Verbose     bool
-	Help        bool
+	Host          string
+	Port          int
+	Username      string
+	Password      string
+	TLS           bool
+	StartTLS      bool
+	Folders       []string
+	ArchiveRoot   string
+	ArchiveIgnore []string // folder names to strip from archive path (e.g. "INBOX")
+	MaxAge        time.Duration
+	BatchSize     int
+	DryRun        bool
+	Verbose       bool
+	Help          bool
 }
 
 // Parse parses command-line arguments and returns a Config.
@@ -39,6 +40,7 @@ func Parse(args []string) (*Config, error) {
 	startTLS := fs.Bool("starttls", false, "Use STARTTLS upgrade (overrides -tls)")
 	folders := fs.String("folders", "INBOX", "Comma-separated list of folders to archive")
 	archiveRoot := fs.String("archive-root", "Archives", "Root folder for archived mail (e.g. Archives)")
+	archiveIgnore := fs.String("ignore-in-archive", "INBOX,Sent", "Comma-separated folder names to strip from archive path (e.g. 'INBOX')")
 	ageDays := fs.Int("age", 365, "Archive messages older than this many days")
 	batchSize := fs.Int("batch", 1000, "Maximum messages to move per batch")
 	dryRun := fs.Bool("dry-run", false, "Show what would be archived without moving anything")
@@ -53,18 +55,19 @@ func Parse(args []string) (*Config, error) {
 	}
 
 	cfg := &Config{
-		Host:        *host,
-		Port:        *port,
-		Username:    *username,
-		Password:    *password,
-		TLS:         *tls,
-		StartTLS:    *startTLS,
-		ArchiveRoot: strings.TrimRight(*archiveRoot, "/"),
-		MaxAge:      time.Duration(*ageDays) * 24 * time.Hour,
-		BatchSize:   *batchSize,
-		DryRun:      *dryRun,
-		Verbose:     *verbose,
-		Help:        *help,
+		Host:          *host,
+		Port:          *port,
+		Username:      *username,
+		Password:      *password,
+		TLS:           *tls,
+		StartTLS:      *startTLS,
+		ArchiveRoot:   strings.TrimRight(*archiveRoot, "/"),
+		ArchiveIgnore: parseIgnoreList(*archiveIgnore),
+		MaxAge:        time.Duration(*ageDays) * 24 * time.Hour,
+		BatchSize:     *batchSize,
+		DryRun:        *dryRun,
+		Verbose:       *verbose,
+		Help:          *help,
 	}
 
 	if cfg.Help {
@@ -115,6 +118,18 @@ func Parse(args []string) (*Config, error) {
 	return cfg, nil
 }
 
+// parseIgnoreList parses a comma-separated list of folder names to ignore in archive paths.
+func parseIgnoreList(s string) []string {
+	var result []string
+	for _, item := range strings.Split(s, ",") {
+		item = strings.TrimSpace(item)
+		if item != "" {
+			result = append(result, item)
+		}
+	}
+	return result
+}
+
 // PrintUsage prints help text.
 func PrintUsage() {
 	fmt.Print(`imap-archiver — Move old IMAP messages into yearly archive folders.
@@ -128,16 +143,17 @@ REQUIRED FLAGS
   --pass <pass>       IMAP password  (or set env var IMAP_PASSWORD)
 
 OPTIONS
-  --port <port>       IMAP port (default 993 with TLS, 143 without)
-  --tls               Use implicit TLS / IMAPS (default true)
-  --starttls          Use STARTTLS instead of implicit TLS
-  --folders <list>    Comma-separated source folders (default: INBOX)
-  --archive-root <f>  Root archive folder name (default: Archives)
-  --age <days>        Archive messages older than N days (default: 365)
-  --batch <n>         Max messages per batch move (default: 1000)
-  --dry-run           Preview only — do not move any messages
-  -v                  Verbose output
-  -h                  Show this help
+  --port <port>          IMAP port (default 993 with TLS, 143 without)
+  --tls                  Use implicit TLS / IMAPS (default true)
+  --starttls             Use STARTTLS instead of implicit TLS
+  --folders <list>       Comma-separated source folders (default: INBOX)
+  --archive-root <f>     Root archive folder name (default: Archives)
+  --ignore-in-archive    Comma-separated folder names to strip from archive path (e.g. INBOX)
+  --age <days>           Archive messages older than N days (default: 365)
+  --batch <n>            Max messages per batch move (default: 1000)
+  --dry-run              Preview only — do not move any messages
+  -v                     Verbose output
+  -h                     Show this help
 
 ARCHIVE LAYOUT
   Messages are moved to:
@@ -145,6 +161,10 @@ ARCHIVE LAYOUT
 
   Example — a 2022 message from "Work/Projects" moves to:
     Archives/2022/Work/Projects
+
+  Use --ignore-in-archive to strip certain folder names:
+    --folders "INBOX/Phabricator" --ignore-in-archive INBOX
+    Archives/2017/Phabricator  (instead of Archives/2017/INBOX/Phabricator)
 
 EXAMPLES
   # Archive INBOX messages older than 1 year (default)

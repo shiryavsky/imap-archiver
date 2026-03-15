@@ -3,6 +3,9 @@
 A command-line Go tool that connects to any IMAP server and moves old messages
 into yearly archive folders, in batches, without downloading message bodies.
 
+WHY: Sometimes your email client can't handle a large number of messages to archive.
+This small solution should help. This helped me sort through millions of E-mails over decades.
+
 ## Archive layout
 
 ```
@@ -52,11 +55,26 @@ go build -o imap-archiver .
 | `--starttls` | `false` | Use STARTTLS upgrade |
 | `--folders` | `INBOX` | Comma-separated list of source folders |
 | `--archive-root` | `Archives` | Root folder for archived mail |
+| `--ignore-in-archive` | `INBOX,Sent` | Folder names to strip from archive path |
 | `--age` | `365` | Archive messages older than N days |
 | `--batch` | `1000` | Max messages per batch move |
 | `--dry-run` | `false` | Preview mode — no messages moved |
 | `-v` | `false` | Verbose / debug output |
 | `-h` | | Show help |
+
+## Archive path filtering
+
+By default, `INBOX` and `Sent` are stripped from the archive path. This means:
+
+- `INBOX/Phabricator` → `Archives/2017/Phabricator`
+- `Sent/Marketing` → `Archives/2022/Marketing`
+
+Use `--ignore-in-archive` to customize which folder names are stripped:
+
+```bash
+./imap-archiver --host imap.example.com --user me@example.com \
+  --pass secret --ignore-in-archive "INBOX,Sent,Archive"
+```
 
 ## How it works
 

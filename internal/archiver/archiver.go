@@ -176,8 +176,39 @@ func (a *Archiver) moveBucket(bucket imapwrap.YearBucket, dest string, sourceFol
 
 // destFolder builds the archive destination path.
 // e.g. folder="Work/Projects", year=2022 → "Archives/2022/Work/Projects"
+// If sourceFolder contains ignored parts (from ArchiveIgnore), they are stripped.
+// e.g. folder="INBOX/Phabricator" with ignore=["INBOX"] → "Archives/2022/Phabricator"
 func (a *Archiver) destFolder(sourceFolder string, year int) string {
-	return fmt.Sprintf("%s/%d/%s", a.cfg.ArchiveRoot, year, sourceFolder)
+	filtered := a.filterIgnoredParts(sourceFolder)
+	return fmt.Sprintf("%s/%d/%s", a.cfg.ArchiveRoot, year, filtered)
+}
+
+// filterIgnoredParts removes ignored folder names from the path.
+// e.g. "INBOX/Phabricator" with ignore=["INBOX"] → "Phabricator"
+func (a *Archiver) filterIgnoredParts(folder string) string {
+	if len(a.cfg.ArchiveIgnore) == 0 {
+		return folder
+	}
+
+	// Split the folder path into parts
+	parts := strings.Split(folder, "/")
+	var result []string
+
+	for _, part := range parts {
+		// Check if this part should be ignored (case-insensitive)
+		ignore := false
+		for _, ignoreName := range a.cfg.ArchiveIgnore {
+			if strings.EqualFold(part, ignoreName) {
+				ignore = true
+				break
+			}
+		}
+		if !ignore {
+			result = append(result, part)
+		}
+	}
+
+	return strings.Join(result, "/")
 }
 
 // printSummary prints a table of results.
