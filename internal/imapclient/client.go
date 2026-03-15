@@ -214,14 +214,17 @@ func (c *Client) MoveUIDs(uids []imap.UID, destFolder string) error {
 		return nil
 	}
 	set := imap.UIDSetNum(uids...)
+	c.log.Info("DEBUG: Moving %d UID(s) to %q (using UID MOVE)", len(uids), destFolder)
 
 	// Use UID MOVE if available (RFC 6851).
-	if _, err := c.raw.Move(set, destFolder).Wait(); err != nil {
+	moveRes, err := c.raw.Move(set, destFolder).Wait()
+	if err != nil {
 		// Fallback: COPY + STORE \Deleted + EXPUNGE
-		c.log.Debug("MOVE unsupported, falling back to COPY+DELETE: %v", err)
+		c.log.Info("DEBUG: MOVE failed, trying COPY: %v", err)
 		if _, err2 := c.raw.Copy(set, destFolder).Wait(); err2 != nil {
 			return fmt.Errorf("COPY to %q: %w", destFolder, err2)
 		}
+		c.log.Info("DEBUG: COPY succeeded, now marking messages as \\Deleted")
 		storeFlags := &imap.StoreFlags{
 			Op:     imap.StoreFlagsAdd,
 			Flags:  []imap.Flag{imap.FlagDeleted},
@@ -230,9 +233,13 @@ func (c *Client) MoveUIDs(uids []imap.UID, destFolder string) error {
 		if err2 := c.raw.Store(set, storeFlags, nil).Close(); err2 != nil {
 			return fmt.Errorf("STORE \\Deleted: %w", err2)
 		}
+		c.log.Info("DEBUG: Marked messages as \\Deleted, now expunging")
 		if err2 := c.raw.Expunge().Close(); err2 != nil {
 			return fmt.Errorf("EXPUNGE: %w", err2)
 		}
+		c.log.Info("DEBUG: Expunge completed - messages should be moved")
+	} else {
+		c.log.Info("DEBUG: MOVE command succeeded, result: %+v", moveRes)
 	}
 	return nil
 }
