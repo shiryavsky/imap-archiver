@@ -12,6 +12,9 @@ import (
 	imap "github.com/emersion/go-imap/v2"
 )
 
+// Ensure imap import is used (for splitBatches / formatUIDs which take []imap.UID).
+var _ = imap.UID(0)
+
 // Stats tracks archive operation results.
 type Stats struct {
 	Folder   string
@@ -61,7 +64,7 @@ func (a *Archiver) Run() error {
 	a.log.Info("Archiving messages older than %s (cutoff: %s)",
 		formatDuration(a.cfg.MaxAge), cutoff.Format("2006-01-02"))
 	a.log.Info("Archive root: %s", a.cfg.ArchiveRoot)
-	a.log.Info("Batch size: %d", a.cfg.BatchSize)
+	a.log.Info("Batch size:   %d", a.cfg.BatchSize)
 
 	var totalStats []Stats
 
@@ -79,74 +82,87 @@ func (a *Archiver) Run() error {
 	return nil
 }
 
-// archiveFolder archives a single source folder.
+// archiveFolder archives one source folder.
+//
+// Strategy: instead of a single SEARCH BEFORE + mass FETCH INTERNALDATE,
+// we issue one lightweight SEARCH per calendar year (SINCE Jan1 BEFORE Jan1+1).
+// The server does the date math; we receive UIDs pre-bucketed by year with zero
+// FETCH traffic. For 20k messages across 5 years this means 5 tiny SEARCH
+// round-trips instead of one giant FETCH response.
 func (a *Archiver) archiveFolder(folder string, cutoff time.Time) (Stats, error) {
 	stats := Stats{Folder: folder}
 
-	// Search for messages before cutoff.
-	uids, err := a.client.SearchOlderThan(folder, cutoff)
-	if err != nil {
-		return stats, fmt.Errorf("search: %w", err)
+	// Select the folder once; all subsequent searches reuse this selection.
+	if err := a.client.SelectFolder(folder); err != nil {
+		return stats, err
 	}
 
-	a.log.Info("Found %d message(s) older than cutoff in %q", len(uids), folder)
-	stats.Examined = len(uids)
+	// Sweep calendar years using server-side SEARCH SINCE/BEFORE.
+	// minYear goes back far enough to catch all realistic mail (30 years).
+	minYear := time.Now().Year() - 30
+	buckets, err := a.client.SearchByYearRange(cutoff, minYear)
+	if err != nil {
+		return stats, fmt.Errorf("year-range search: %w", err)
+	}
 
-	if len(uids) == 0 {
+	if len(buckets) == 0 {
+		a.log.Info("No messages older than cutoff found in %q", folder)
 		return stats, nil
 	}
 
-	// Fetch INTERNALDATE for all candidates so we can bucket by year.
-	a.log.Info("Fetching dates for %d message(s)…", len(uids))
-	dates, err := a.client.FetchInternalDate(uids)
-	if err != nil {
-		return stats, fmt.Errorf("fetch dates: %w", err)
+	// Log a compact summary before we start moving.
+	total := 0
+	for _, b := range buckets {
+		total += len(b.UIDs)
+		a.log.Info("  Year %d: %d message(s)", b.Year, len(b.UIDs))
+	}
+	a.log.Info("Total to archive: %d message(s) across %d year(s)", total, len(buckets))
+	stats.Examined = total
+
+	// Process each year-bucket independently.
+	for _, bucket := range buckets {
+		dest := a.destFolder(folder, bucket.Year)
+		s, err := a.moveBucket(bucket, dest)
+		stats.Archived += s.Archived
+		stats.Skipped += s.Skipped
+		stats.Errors += s.Errors
+		if err != nil {
+			a.log.Error("Year %d: %v", bucket.Year, err)
+		}
 	}
 
-	// Group UIDs by target archive folder (Archives/YYYY/folder-path).
-	byDest := make(map[string][]imap.UID)
-	for _, uid := range uids {
-		date, ok := dates[uid]
-		if !ok {
-			a.log.Warn("No date for UID %d — skipping", uid)
-			stats.Skipped++
+	return stats, nil
+}
+
+// moveBucket moves all UIDs in a YearBucket to dest, in batches.
+func (a *Archiver) moveBucket(bucket imapwrap.YearBucket, dest string) (Stats, error) {
+	var stats Stats
+	a.log.Info("→ %s (%d messages)", dest, len(bucket.UIDs))
+
+	if !a.cfg.DryRun {
+		if err := a.client.EnsureFolder(dest); err != nil {
+			stats.Errors += len(bucket.UIDs)
+			return stats, fmt.Errorf("create folder %q: %w", dest, err)
+		}
+	}
+
+	batches := splitBatches(bucket.UIDs, a.cfg.BatchSize)
+	for i, batch := range batches {
+		a.log.Info("  Batch %d/%d: %d message(s)…", i+1, len(batches), len(batch))
+
+		if a.cfg.DryRun {
+			a.log.Info("  [DRY RUN] Would move UIDs: %s", formatUIDs(batch, 10))
+			stats.Archived += len(batch)
 			continue
 		}
-		dest := a.destFolder(folder, date.Year())
-		byDest[dest] = append(byDest[dest], uid)
-	}
 
-	// Move in batches, grouped by destination year-folder.
-	for dest, destUIDs := range byDest {
-		a.log.Info("→ Destination: %s (%d messages)", dest, len(destUIDs))
-
-		if !a.cfg.DryRun {
-			if err := a.client.EnsureFolder(dest); err != nil {
-				a.log.Error("Cannot create folder %q: %v", dest, err)
-				stats.Errors += len(destUIDs)
-				continue
-			}
+		if err := a.client.MoveUIDs(batch, dest); err != nil {
+			a.log.Error("  Move failed: %v", err)
+			stats.Errors += len(batch)
+			continue
 		}
-
-		batches := splitBatches(destUIDs, a.cfg.BatchSize)
-		for i, batch := range batches {
-			a.log.Info("  Batch %d/%d: moving %d message(s)…",
-				i+1, len(batches), len(batch))
-
-			if a.cfg.DryRun {
-				a.log.Info("  [DRY RUN] Would move UIDs: %s", formatUIDs(batch, 10))
-				stats.Archived += len(batch)
-				continue
-			}
-
-			if err := a.client.MoveUIDs(batch, dest); err != nil {
-				a.log.Error("  Move failed: %v", err)
-				stats.Errors += len(batch)
-				continue
-			}
-			stats.Archived += len(batch)
-			a.log.Info("  ✓ Moved %d message(s)", len(batch))
-		}
+		stats.Archived += len(batch)
+		a.log.Info("  ✓ Moved %d message(s)", len(batch))
 	}
 
 	return stats, nil

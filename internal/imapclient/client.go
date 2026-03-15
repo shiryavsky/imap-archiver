@@ -96,47 +96,116 @@ func (c *Client) EnsureFolder(name string) error {
 	return nil
 }
 
-// SearchOlderThan returns UIDs of messages in folder older than cutoff.
-func (c *Client) SearchOlderThan(folder string, cutoff time.Time) ([]imap.UID, error) {
-	c.log.Debug("Selecting folder: %s", folder)
-	if _, err := c.raw.Select(folder, nil).Wait(); err != nil {
-		return nil, fmt.Errorf("select %q: %w", folder, err)
-	}
-
-	criteria := &imap.SearchCriteria{
-		Before: cutoff,
-	}
-	c.log.Debug("Searching for messages before %s", cutoff.Format("2006-01-02"))
-	data, err := c.raw.UIDSearch(criteria, nil).Wait()
-	if err != nil {
-		return nil, fmt.Errorf("UID SEARCH: %w", err)
-	}
-
-	return data.AllUIDs(), nil
+// YearBucket is a set of UIDs that all belong to a single calendar year.
+type YearBucket struct {
+	Year int
+	UIDs []imap.UID
 }
 
-// FetchInternalDate fetches the INTERNALDATE of a set of UIDs.
-// Returns a map[UID]time.Time.
-func (c *Client) FetchInternalDate(uids []imap.UID) (map[imap.UID]time.Time, error) {
-	if len(uids) == 0 {
+// SelectFolder selects an IMAP folder. Must be called before searches.
+func (c *Client) SelectFolder(folder string) error {
+	c.log.Debug("Selecting folder: %s", folder)
+	if _, err := c.raw.Select(folder, nil).Wait(); err != nil {
+		return fmt.Errorf("select %q: %w", folder, err)
+	}
+	return nil
+}
+
+// SearchByYearRange queries the server once per calendar year using
+// SEARCH SINCE <Jan 1 YYYY> BEFORE <Jan 1 YYYY+1>, avoiding any FETCH call.
+// It sweeps from (cutoff.Year - 1) down to minYear, stopping as soon as two
+// consecutive empty years are seen (heuristic: mailbox floor reached).
+//
+// The folder must already be selected via SelectFolder.
+func (c *Client) SearchByYearRange(cutoff time.Time, minYear int) ([]YearBucket, error) {
+	endYear := cutoff.Year() - 1 // messages from cutoff.Year are not yet archivable
+	if endYear < minYear {
 		return nil, nil
 	}
 
-	set := imap.UIDSetNum(uids...)
-	fetchOpts := &imap.FetchOptions{
-		InternalDate: true,
+	c.log.Debug("Sweeping years %d → %d using server-side SEARCH", endYear, minYear)
+
+	var buckets []YearBucket
+	emptyStreak := 0
+
+	for year := endYear; year >= minYear; year-- {
+		jan1 := time.Date(year, 1, 1, 0, 0, 0, 0, time.UTC)
+		jan1Next := time.Date(year+1, 1, 1, 0, 0, 0, 0, time.UTC)
+
+		// Skip the partial current year — only use the BEFORE cutoff bound for it.
+		// For the cutoff year itself the caller already handled the boundary.
+		criteria := &imap.SearchCriteria{
+			Since:  jan1,
+			Before: jan1Next,
+		}
+		// For the most recent archivable year, cap at cutoff.
+		if year == endYear {
+			criteria.Before = cutoff
+		}
+
+		data, err := c.raw.UIDSearch(criteria, nil).Wait()
+		if err != nil {
+			return nil, fmt.Errorf("SEARCH year %d: %w", year, err)
+		}
+
+		uids := data.AllUIDs()
+		c.log.Debug("  Year %d: %d message(s)", year, len(uids))
+
+		if len(uids) == 0 {
+			emptyStreak++
+			if emptyStreak >= 3 {
+				c.log.Debug("  Three consecutive empty years — stopping sweep at %d", year)
+				break
+			}
+			continue
+		}
+		emptyStreak = 0
+		buckets = append(buckets, YearBucket{Year: year, UIDs: uids})
 	}
 
-	msgs, err := c.raw.Fetch(set, fetchOpts).Collect()
-	if err != nil {
-		return nil, fmt.Errorf("FETCH INTERNALDATE: %w", err)
+	return buckets, nil
+}
+
+// FetchInternalDatePaged fetches INTERNALDATE for uids in pages of pageSize,
+// to avoid overwhelming servers with a single giant FETCH command.
+// This is a fallback for when SearchByYearRange cannot be used.
+func (c *Client) FetchInternalDatePaged(uids []imap.UID, pageSize int) (map[imap.UID]time.Time, error) {
+	if len(uids) == 0 {
+		return nil, nil
+	}
+	if pageSize <= 0 {
+		pageSize = 500
 	}
 
-	result := make(map[imap.UID]time.Time, len(msgs))
-	for _, msg := range msgs {
-		result[msg.UID] = msg.InternalDate
+	result := make(map[imap.UID]time.Time, len(uids))
+	pages := pageSlice(uids, pageSize)
+
+	for i, page := range pages {
+		c.log.Debug("  FETCH INTERNALDATE page %d/%d (%d UIDs)…", i+1, len(pages), len(page))
+		set := imap.UIDSetNum(page...)
+		msgs, err := c.raw.Fetch(set, &imap.FetchOptions{InternalDate: true}).Collect()
+		if err != nil {
+			return nil, fmt.Errorf("FETCH page %d: %w", i+1, err)
+		}
+		for _, msg := range msgs {
+			result[msg.UID] = msg.InternalDate
+		}
 	}
 	return result, nil
+}
+
+// pageSlice splits a UID slice into pages of at most n items.
+func pageSlice(uids []imap.UID, n int) [][]imap.UID {
+	var pages [][]imap.UID
+	for len(uids) > 0 {
+		sz := n
+		if sz > len(uids) {
+			sz = len(uids)
+		}
+		pages = append(pages, uids[:sz])
+		uids = uids[sz:]
+	}
+	return pages
 }
 
 // MoveUIDs moves a set of UIDs to destFolder using IMAP MOVE (or COPY+EXPUNGE).
