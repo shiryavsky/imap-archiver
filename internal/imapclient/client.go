@@ -76,15 +76,15 @@ func (c *Client) Close() {
 }
 
 // EnsureFolder creates a mailbox if it does not already exist.
+// Note: This function may leave the connection in an inconsistent state (selected folder changed).
+// Callers should re-select the source folder after this function returns.
 func (c *Client) EnsureFolder(name string) error {
 	c.log.Debug("Ensuring folder exists: %s", name)
 
 	// Try to select; if that works it exists.
-	data, err := c.raw.Select(name, nil).Wait()
+	_, err := c.raw.Select(name, nil).Wait()
 	if err == nil {
-		_ = data
-		// Deselect by selecting INBOX (harmless).
-		_, _ = c.raw.Select("INBOX", nil).Wait()
+		c.log.Debug("Folder %q already exists", name)
 		return nil
 	}
 

@@ -122,7 +122,7 @@ func (a *Archiver) archiveFolder(folder string, cutoff time.Time) (Stats, error)
 	// Process each year-bucket independently.
 	for _, bucket := range buckets {
 		dest := a.destFolder(folder, bucket.Year)
-		s, err := a.moveBucket(bucket, dest)
+		s, err := a.moveBucket(bucket, dest, folder)
 		stats.Archived += s.Archived
 		stats.Skipped += s.Skipped
 		stats.Errors += s.Errors
@@ -135,7 +135,7 @@ func (a *Archiver) archiveFolder(folder string, cutoff time.Time) (Stats, error)
 }
 
 // moveBucket moves all UIDs in a YearBucket to dest, in batches.
-func (a *Archiver) moveBucket(bucket imapwrap.YearBucket, dest string) (Stats, error) {
+func (a *Archiver) moveBucket(bucket imapwrap.YearBucket, dest string, sourceFolder string) (Stats, error) {
 	var stats Stats
 	a.log.Info("→ %s (%d messages)", dest, len(bucket.UIDs))
 
@@ -143,6 +143,12 @@ func (a *Archiver) moveBucket(bucket imapwrap.YearBucket, dest string) (Stats, e
 		if err := a.client.EnsureFolder(dest); err != nil {
 			stats.Errors += len(bucket.UIDs)
 			return stats, fmt.Errorf("create folder %q: %w", dest, err)
+		}
+		// Re-select the source folder after EnsureFolder may have changed it.
+		// EnsureFolder ends by selecting INBOX, which breaks subsequent COPY/MOVE.
+		if err := a.client.SelectFolder(sourceFolder); err != nil {
+			stats.Errors += len(bucket.UIDs)
+			return stats, fmt.Errorf("re-select folder %q: %w", sourceFolder, err)
 		}
 	}
 
